@@ -250,9 +250,9 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Get inputs
-    csv_path = input("Enter path to CSV file with image names: ")
-    base_image_dir = input("Enter base directory containing the images: ")
-    model_save_path = input("Enter path to save model (default: gesture_model.h5): ") or "gesture_model.h5"
+    csv_path = '/home/jinwoo/Desktop/hand-guesture-datascience/train.csv'
+    base_image_dir = '/home/jinwoo/Desktop/hand-guesture-datascience/train'
+    model_save_path = "gesture_model.h5"
     
     # Validate inputs
     if not os.path.exists(csv_path):
