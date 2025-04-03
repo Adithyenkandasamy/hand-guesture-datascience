@@ -3,10 +3,10 @@ import numpy as np
 import pandas as pd
 import cv2
 from sklearn.model_selection import train_test_split
-from keras.models import Sequential
-from keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D, GlobalAveragePooling2D
-from keras.callbacks import EarlyStopping, ModelCheckpoint
-from keras.preprocessing.image import ImageDataGenerator
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D, GlobalAveragePooling2D
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 import time
 
 # Configuration
@@ -195,17 +195,31 @@ def train_gesture_model(csv_path, base_image_dir, model_save_path):
         model = create_model()
         model.summary(print_fn=logger.info)
         
-        # Data augmentation
+        # Data augmentation (using the newer TensorFlow API)
         logger.info("Setting up data augmentation...")
-        datagen = ImageDataGenerator(
-            rotation_range=20,
-            width_shift_range=0.2,
-            height_shift_range=0.2,
-            shear_range=0.2,
-            zoom_range=0.2,
-            horizontal_flip=True,
-            fill_mode='nearest'
-        )
+        data_augmentation = tf.keras.Sequential([
+            tf.keras.layers.RandomRotation(0.2),
+            tf.keras.layers.RandomTranslation(0.2, 0.2),
+            tf.keras.layers.RandomZoom(0.2),
+            tf.keras.layers.RandomFlip(mode="horizontal"),
+        ])
+        
+        # Apply augmentation during training
+        def augment(x_batch, y_batch):
+            x_batch = data_augmentation(x_batch)
+            return x_batch, y_batch
+            
+        # Create TF dataset for training
+        train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+        train_dataset = train_dataset.shuffle(buffer_size=len(X_train))
+        train_dataset = train_dataset.batch(BATCH_SIZE)
+        train_dataset = train_dataset.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+        
+        # Create TF dataset for validation
+        val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val))
+        val_dataset = val_dataset.batch(BATCH_SIZE)
+        val_dataset = val_dataset.prefetch(tf.data.AUTOTUNE)
         
         # Callbacks
         logger.info("Setting up training callbacks...")
@@ -217,10 +231,9 @@ def train_gesture_model(csv_path, base_image_dir, model_save_path):
         # Train model
         logger.info("Starting model training...")
         history = model.fit(
-            datagen.flow(X_train, y_train, batch_size=BATCH_SIZE),
-            steps_per_epoch=len(X_train) // BATCH_SIZE,
+            train_dataset,
             epochs=EPOCHS,
-            validation_data=(X_val, y_val),
+            validation_data=val_dataset,
             callbacks=callbacks,
             verbose=1
         )
@@ -230,7 +243,7 @@ def train_gesture_model(csv_path, base_image_dir, model_save_path):
         model.save(model_save_path)
         
         # Report training results
-        val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+        val_loss, val_acc = model.evaluate(val_dataset, verbose=0)
         logger.info(f"Final validation accuracy: {val_acc:.4f}")
         logger.info(f"Final validation loss: {val_loss:.4f}")
         
