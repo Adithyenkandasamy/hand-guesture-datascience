@@ -2,5 +2,6 @@ env
 train
 gesture_model.h5
 val
-gesture_model_20250404-204951/
+
+gesture_model_20250404-205437/
 
