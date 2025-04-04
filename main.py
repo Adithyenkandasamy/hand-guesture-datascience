@@ -1,232 +1,286 @@
 import numpy as np
 import os
 import cv2
-import datetime
-from PIL import Image
-import matplotlib.pyplot as plt
+import time
+from collections import deque
 import mediapipe as mp
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model
-import pyautogui  # For controlling YouTube (keyboard actions)
+from tensorflow.keras.models import load_model
+import pyautogui
 
-# Configuration parameters
-IMG_SIZE = 100  # Size to resize frames to (height and width)
-NUM_FRAMES = 18  # Number of frames to use from each video
-NUM_CLASSES = 5  # Number of gesture classes
+# Configuration
+IMG_SIZE = 64  # Reduced from 100 to save memory
+NUM_FRAMES = 12  # Reduced from 18 to save memory
+NUM_CLASSES = 5
+PREDICTION_THRESHOLD = 0.65
+SKIP_FRAMES = 3  # Process every 3rd frame for detection
+PREDICTION_INTERVAL = 0.8  # Seconds between predictions
 
-# Gesture labels and corresponding YouTube actions
 GESTURE_CLASSES = {
-    0: "Thumbs Up",    # Increase volume (press +)
-    1: "Thumbs Down",  # Decrease volume (press -)
-    2: "Left Swipe",   # Rewind 10 seconds (press Left Arrow)
-    3: "Right Swipe",  # Forward 10 seconds (press Right Arrow)
-    4: "Stop"          # Pause/Play (press Spacebar)
+    0: "Thumbs Up",    # Volume +
+    1: "Thumbs Down",  # Volume -
+    2: "Left Swipe",   # Rewind
+    3: "Right Swipe",  # Forward
+    4: "Stop"          # Pause/Play
 }
 
-# Initialize MediaPipe Hands
+# MediaPipe setup with reduced complexity
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
 
-# Helper functions
 def normalize_frames(frames):
-    """Normalize pixel values to range [0, 1]"""
     return frames / 255.0
 
 def detect_and_crop_hand(frame, hands):
-    """
-    Detect hand in frame and crop to hand area with padding
-    Returns the cropped hand image or the original frame if no hand is detected
-    """
-    # Convert to RGB for MediaPipe
+    # Convert to RGB only once
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(frame_rgb)
-    
-    # Create a copy for drawing
-    annotated_frame = frame.copy()
-    
-    h, w, c = frame.shape
-    
-    # Check if hand landmarks are detected
+    annotated = frame.copy()
+    h, w, _ = frame.shape
+
     if results.multi_hand_landmarks:
-        # Get the first hand detected
         hand_landmarks = results.multi_hand_landmarks[0]
-        
-        # Draw hand landmarks on the frame
+        # Simple drawing without styles to save processing
         mp_drawing.draw_landmarks(
-            annotated_frame,
-            hand_landmarks,
-            mp_hands.HAND_CONNECTIONS,
-            mp_drawing_styles.get_default_hand_landmarks_style(),
-            mp_drawing_styles.get_default_hand_connections_style()
+            annotated, hand_landmarks, mp_hands.HAND_CONNECTIONS
         )
-        
-        # Extract bounding box coordinates
+
+        # Calculate bounding box
         x_min, y_min = w, h
         x_max, y_max = 0, 0
-        
-        for landmark in hand_landmarks.landmark:
-            x, y = int(landmark.x * w), int(landmark.y * h)
-            x_min = min(x_min, x)
-            y_min = min(y_min, y)
-            x_max = max(x_max, x)
-            y_max = max(y_max, y)
-        
-        # Add padding to the bounding box
+
+        for lm in hand_landmarks.landmark:
+            x, y = int(lm.x * w), int(lm.y * h)
+            x_min, y_min = min(x_min, x), min(y_min, y)
+            x_max, y_max = max(x_max, x), max(y_max, y)
+
+        # Add padding
         padding = 20
-        x_min = max(0, x_min - padding)
-        y_min = max(0, y_min - padding)
-        x_max = min(w, x_max + padding)
-        y_max = min(h, y_max + padding)
-        
-        # Ensure minimum size of the bounding box
+        x_min, y_min = max(0, x_min - padding), max(0, y_min - padding)
+        x_max, y_max = min(w, x_max + padding), min(h, y_max + padding)
+
+        # Enforce minimum crop size
         if x_max - x_min < 50:
-            center = (x_min + x_max) // 2
-            x_min = max(0, center - 25)
-            x_max = min(w, center + 25)
-        
+            center_x = (x_min + x_max) // 2
+            x_min = max(0, center_x - 25)
+            x_max = min(w, center_x + 25)
         if y_max - y_min < 50:
-            center = (y_min + y_max) // 2
-            y_min = max(0, center - 25)
-            y_max = min(h, center + 25)
-        
-        # Crop the hand region
-        hand_crop = frame[y_min:y_max, x_min:x_max]
-        
-        # Return both cropped hand and annotated frame
-        return hand_crop, annotated_frame, True
-    
-    return frame, annotated_frame, False
+            center_y = (y_min + y_max) // 2
+            y_min = max(0, center_y - 25)
+            y_max = min(h, center_y + 25)
 
-def preprocess_frame(frame, target_size=(IMG_SIZE, IMG_SIZE)):
-    """Preprocess a single frame: resize to target size"""
-    # Convert to PIL Image if not already
-    if not isinstance(frame, Image.Image):
-        try:
-            frame = Image.fromarray(frame)
-        except:
-            # Handle case where frame might be None or invalid
-            return np.zeros((target_size[0], target_size[1], 3))
-    
-    # Resize to target size
-    frame = frame.resize(target_size)
-    
-    # Convert to numpy array
-    frame = np.asarray(frame).astype(np.float32)
-    
-    return frame
+        cropped = frame[y_min:y_max, x_min:x_max]
+        return cropped, annotated, True
 
-# Camera capture and real-time prediction
-def capture_and_predict(model, camera_source=0, prediction_threshold=0.65):
-    """Capture video from webcam, detect hands, and make real-time predictions"""
+    return frame, annotated, False
+
+def preprocess_frame(frame, size=(IMG_SIZE, IMG_SIZE)):
+    try:
+        # Direct OpenCV resize is faster than PIL
+        frame = cv2.resize(frame, size)
+        # Convert to float32 only when needed for model input
+        return frame
+    except Exception:
+        return np.zeros((size[0], size[1], 3), dtype=np.uint8)
+
+def perform_youtube_action(pred_class):
+    actions = {
+        0: ('+', "Volume UP"),
+        1: ('-', "Volume DOWN"),
+        2: ('left', "Rewind 10s"),
+        3: ('right', "Forward 10s"),
+        4: ('space', "Pause/Play")
+    }
+    key, action = actions.get(pred_class, (None, None))
+    if key:
+        pyautogui.press(key)
+        return action
+    return None
+
+def capture_and_predict(model, camera_source=0):
+    # Try to optimize camera capture
     cap = cv2.VideoCapture(camera_source)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Lower resolution
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Lower resolution
     
-    # Check if camera opened successfully
     if not cap.isOpened():
-        print("Error: Could not open camera.")
+        print("Error: Camera not accessible.")
         return
+
+    # Use deque for efficient frame buffer management
+    frame_buffer = deque(maxlen=NUM_FRAMES)
     
-    # Buffer to store processed frames
-    frame_buffer = []
+    # Performance tracking
+    prev_time = time.time()
+    frame_count = 0
+    last_prediction_time = 0
     
-    print("Starting real-time gesture recognition. Press 'q' to quit.")
-    print("Make sure the YouTube video is playing and focused in your browser.")
+    # Accuracy tracking
+    recent_predictions = deque(maxlen=10)
+    accuracy_history = deque(maxlen=20)  # Keep only recent accuracy values
+    current_gesture = None
+    action_performed = None
     
-    # Initialize MediaPipe Hands
+    # Enable mixed precision for better performance (if available)
+    if hasattr(tf, 'keras'):
+        try:
+            from tensorflow.keras.mixed_precision import set_global_policy
+            set_global_policy('mixed_float16')
+            print("Mixed precision enabled")
+        except:
+            print("Mixed precision not available")
+
+    # Reduce hand detection complexity
     with mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
         min_detection_confidence=0.5,
-        min_tracking_confidence=0.5) as hands:
-        
+        min_tracking_confidence=0.5,
+        model_complexity=0  # Use simplest model
+    ) as hands:
+
+        print("Press 'q' to quit.")
         while True:
-            # Capture frame-by-frame
             ret, frame = cap.read()
-            
             if not ret:
-                print("Error: Failed to capture frame.")
+                print("Error: Frame capture failed.")
                 break
+
+            # Process only every nth frame for hand detection
+            process_this_frame = frame_count % SKIP_FRAMES == 0
             
-            # Detect and crop hand
-            hand_crop, annotated_frame, hand_detected = detect_and_crop_hand(frame, hands)
-            
-            # Preprocess the frame
-            if hand_detected:
-                processed_frame = preprocess_frame(hand_crop, (IMG_SIZE, IMG_SIZE))
-                
-                # Add to buffer and keep only the required number of frames
-                frame_buffer.append(processed_frame)
-                if len(frame_buffer) > NUM_FRAMES:
-                    frame_buffer.pop(0)
-                
-                # Make prediction when buffer is full
-                if len(frame_buffer) == NUM_FRAMES:
-                    # Prepare input for model
-                    input_data = np.array([normalize_frames(np.array(frame_buffer))])
-                    
-                    # Make prediction
-                    prediction = model.predict(input_data, verbose=0)[0]
-                    predicted_class = np.argmax(prediction)
-                    confidence = prediction[predicted_class]
-                    
-                    # Display prediction if confidence is above threshold
-                    if confidence > prediction_threshold:
-                        gesture = GESTURE_CLASSES[predicted_class]
-                        cv2.putText(annotated_frame, f"{gesture} ({confidence:.2f})", (10, 30),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        
-                        # Perform YouTube action based on predicted gesture
-                        if predicted_class == 0:  # Thumbs Up
-                            pyautogui.press('+')  # Increase volume
-                            print("Action: Volume UP (+)")
-                        elif predicted_class == 1:  # Thumbs Down
-                            pyautogui.press('-')  # Decrease volume
-                            print("Action: Volume DOWN (-)")
-                        elif predicted_class == 2:  # Left Swipe
-                            pyautogui.press('left')  # Rewind 10 seconds
-                            print("Action: Rewind 10s (Left Arrow)")
-                        elif predicted_class == 3:  # Right Swipe
-                            pyautogui.press('right')  # Forward 10 seconds
-                            print("Action: Forward 10s (Right Arrow)")
-                        elif predicted_class == 4:  # Stop
-                            pyautogui.press('space')  # Pause/Play
-                            print("Action: Pause/Play (Spacebar)")
+            if process_this_frame:
+                cropped, annotated, hand_found = detect_and_crop_hand(frame, hands)
             else:
-                annotated_frame = frame
-                # Clear buffer if no hand detected for some frames
-                if len(frame_buffer) > 0:
-                    frame_buffer.pop(0)
+                annotated = frame.copy()
+                hand_found = len(frame_buffer) > 0  # Continue using previous detection
                 
-                # Display message when no hand is detected
-                cv2.putText(annotated_frame, "No hand detected", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            frame_count += 1
             
-            # Display the frame with annotations
-            cv2.imshow('Hand Gesture Recognition', annotated_frame)
+            # Display status
+            curr_time = time.time()
+            fps = 1 / max(curr_time - prev_time, 0.001)  # Avoid division by zero
+            prev_time = curr_time
+
+            if hand_found and process_this_frame:
+                processed = preprocess_frame(cropped)
+                frame_buffer.append(processed)
+
+                # Only predict at certain intervals
+                if (len(frame_buffer) == NUM_FRAMES and 
+                    curr_time - last_prediction_time > PREDICTION_INTERVAL):
+                    
+                    last_prediction_time = curr_time
+                    
+                    # Convert to model input format
+                    input_frames = np.array([f for f in frame_buffer], dtype=np.float32)
+                    input_data = np.array([normalize_frames(input_frames)])
+                    
+                    # Run prediction
+                    prediction = model.predict(input_data, verbose=0)[0]
+                    pred_class = np.argmax(prediction)
+                    confidence = prediction[pred_class]
+                    
+                    # Track prediction if confident
+                    if confidence > PREDICTION_THRESHOLD:
+                        gesture = GESTURE_CLASSES[pred_class]
+                        current_gesture = gesture
+                        action_performed = perform_youtube_action(pred_class)
+                        
+                        # Add to recent predictions
+                        recent_predictions.append((pred_class, confidence))
+                        
+                        # Calculate accuracy
+                        if len(recent_predictions) >= 3:
+                            # How many predictions match the current one
+                            matching = sum(1 for p, _ in recent_predictions if p == pred_class)
+                            accuracy = (matching / len(recent_predictions)) * 100
+                            accuracy_history.append(accuracy)
+            elif process_this_frame:
+                # Clear buffer when hand is lost
+                frame_buffer.clear()
+                current_gesture = None
             
-            # Break the loop if 'q' is pressed
+            # Create information display
+            # Create a smaller, semi-transparent overlay instead of writing on the image
+            info_overlay = np.zeros((150, 250, 3), dtype=np.uint8)
+            
+            # FPS
+            cv2.putText(info_overlay, f"FPS: {fps:.1f}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            
+            # Gesture
+            if current_gesture:
+                cv2.putText(info_overlay, f"Gesture: {current_gesture}", (10, 60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            else:
+                cv2.putText(info_overlay, "No gesture", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+            
+            # Action
+            if action_performed:
+                cv2.putText(info_overlay, f"Action: {action_performed}", (10, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+            
+            # Accuracy
+            if accuracy_history:
+                avg_accuracy = sum(accuracy_history) / len(accuracy_history)
+                cv2.putText(info_overlay, f"Accuracy: {avg_accuracy:.1f}%", (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 1)
+            
+            # Add overlay to main frame
+            x_offset, y_offset = 10, 10
+            overlay_h, overlay_w = info_overlay.shape[:2]
+            
+            # Make sure overlay fits within the frame
+            if y_offset + overlay_h <= annotated.shape[0] and x_offset + overlay_w <= annotated.shape[1]:
+                # Create a semi-transparent background
+                annotated[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = \
+                    cv2.addWeighted(
+                        annotated[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w],
+                        0.5,  # Alpha for original content
+                        info_overlay,
+                        0.5,  # Alpha for overlay
+                        0
+                    )
+            
+            # Resize for display if needed
+            if annotated.shape[0] > 600 or annotated.shape[1] > 800:
+                display_frame = cv2.resize(annotated, (800, 600))
+            else:
+                display_frame = annotated
+                
+            cv2.imshow("Gesture Control", display_frame)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-        
-        # Release the capture and close windows
-        cap.release()
-        cv2.destroyAllWindows()
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 def main():
-    # Load the trained model
-    model_path = 'your_model.h5'  # Replace with the actual path to your saved model
+    model_path = '/home/jinwoo/Desktop/hand-guesture-datascience/gesture_model_20250404-205437/final_gesture_model.h5'
     if not os.path.exists(model_path):
-        print(f"Error: Model file not found at {model_path}.  Make sure you have trained the model and that the path is correct.")
+        print("Model file not found:", model_path)
         return
 
     try:
+        # Attempt to configure TensorFlow to use less memory
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print("GPU memory growth enabled")
+                
+        # Load model
+        print("Loading model...")
         model = load_model(model_path)
+        print("Model loaded successfully.")
+        
+        # Run
+        capture_and_predict(model)
     except Exception as e:
-        print(f"Error: Failed to load model from {model_path}.  Error details: {e}")
-        return
-    
-    # Run the webcam prediction
-    capture_and_predict(model)
+        print("Error:", e)
 
 if __name__ == "__main__":
     main()
