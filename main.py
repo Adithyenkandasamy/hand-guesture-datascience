@@ -8,9 +8,9 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 import pyautogui
 
-# Configuration
-IMG_SIZE = 64  # Reduced from 100 to save memory
-NUM_FRAMES = 12  # Reduced from 18 to save memory
+# Configuration - these will be updated after inspecting the model
+IMG_SIZE = 100  # Back to original size
+NUM_FRAMES = 18  # Back to original size
 NUM_CLASSES = 5
 PREDICTION_THRESHOLD = 0.65
 SKIP_FRAMES = 3  # Process every 3rd frame for detection
@@ -78,15 +78,16 @@ def preprocess_frame(frame, size=(IMG_SIZE, IMG_SIZE)):
     try:
         # Direct OpenCV resize is faster than PIL
         frame = cv2.resize(frame, size)
-        # Convert to float32 only when needed for model input
-        return frame
-    except Exception:
-        return np.zeros((size[0], size[1], 3), dtype=np.uint8)
+        # Convert to float32 for model input
+        return frame.astype(np.float32)
+    except Exception as e:
+        print(f"Error preprocessing frame: {e}")
+        return np.zeros((size[0], size[1], 3), dtype=np.float32)
 
 def perform_youtube_action(pred_class):
     actions = {
-        0: ('+', "Volume UP"),
-        1: ('-', "Volume DOWN"),
+        0: ('up', "Volume UP"),
+        1: ('down', "Volume DOWN"),
         2: ('left', "Rewind 10s"),
         3: ('right', "Forward 10s"),
         4: ('space', "Pause/Play")
@@ -97,7 +98,59 @@ def perform_youtube_action(pred_class):
         return action
     return None
 
+def inspect_model(model_path):
+    """Inspect the model to understand its input shape requirements"""
+    model = load_model(model_path)
+    print("\nModel Summary:")
+    model.summary()
+    
+    # Get input shape
+    input_shape = model.input_shape
+    print(f"\nInput shape: {input_shape}")
+    
+    # If it's a sequential model, check first layer
+    if hasattr(model, 'layers') and len(model.layers) > 0:
+        first_layer = model.layers[0]
+        print(f"First layer: {first_layer.name}, Input shape: {first_layer.input_shape}")
+    
+    # Return the expected frame count and image size
+    if input_shape and len(input_shape) > 2:
+        # Handle different possible input shapes
+        if len(input_shape) == 5:  # (None, frames, height, width, channels)
+            return input_shape[1], input_shape[2], input_shape[3]
+        elif len(input_shape) == 4:  # (None, height, width, channels*frames) or similar
+            return None, input_shape[1], input_shape[2]
+    
+    # Default if shape can't be determined
+    return NUM_FRAMES, IMG_SIZE, IMG_SIZE
+
+def prepare_input_batch(frames, model_input_shape):
+    """Prepare the input based on model's expected shape"""
+    # Convert frames to numpy array
+    frames_array = np.array(frames, dtype=np.float32)
+    
+    # Normalize
+    frames_array = normalize_frames(frames_array)
+    
+    # Check the expected input shape
+    if len(model_input_shape) == 5:  # (None, frames, height, width, channels)
+        # Model expects 3D+time input
+        return np.array([frames_array])
+    elif len(model_input_shape) == 4:  # (None, height, width, channels*frames) or similar
+        # Model might expect flattened frames
+        batch_size, frame_count, height, width, channels = frames_array.shape
+        # Reshape to flatten the frames dimension
+        flattened = frames_array.reshape(batch_size, height, width, channels * frame_count)
+        return flattened
+    
+    # Default - just return the normalized frames
+    return np.array([frames_array])
+
 def capture_and_predict(model, camera_source=0):
+    # Get model input shape
+    input_shape = model.input_shape
+    print(f"Model input shape: {input_shape}")
+    
     # Try to optimize camera capture
     cap = cv2.VideoCapture(camera_source)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Lower resolution
@@ -120,15 +173,6 @@ def capture_and_predict(model, camera_source=0):
     accuracy_history = deque(maxlen=20)  # Keep only recent accuracy values
     current_gesture = None
     action_performed = None
-    
-    # Enable mixed precision for better performance (if available)
-    if hasattr(tf, 'keras'):
-        try:
-            from tensorflow.keras.mixed_precision import set_global_policy
-            set_global_policy('mixed_float16')
-            print("Mixed precision enabled")
-        except:
-            print("Mixed precision not available")
 
     # Reduce hand detection complexity
     with mp_hands.Hands(
@@ -145,6 +189,9 @@ def capture_and_predict(model, camera_source=0):
             if not ret:
                 print("Error: Frame capture failed.")
                 break
+                
+            # Flip the frame horizontally to create mirror effect
+            frame = cv2.flip(frame, 1)
 
             # Process only every nth frame for hand detection
             process_this_frame = frame_count % SKIP_FRAMES == 0
@@ -163,7 +210,7 @@ def capture_and_predict(model, camera_source=0):
             prev_time = curr_time
 
             if hand_found and process_this_frame:
-                processed = preprocess_frame(cropped)
+                processed = preprocess_frame(cropped, size=(IMG_SIZE, IMG_SIZE))
                 frame_buffer.append(processed)
 
                 # Only predict at certain intervals
@@ -172,37 +219,41 @@ def capture_and_predict(model, camera_source=0):
                     
                     last_prediction_time = curr_time
                     
-                    # Convert to model input format
-                    input_frames = np.array([f for f in frame_buffer], dtype=np.float32)
-                    input_data = np.array([normalize_frames(input_frames)])
-                    
-                    # Run prediction
-                    prediction = model.predict(input_data, verbose=0)[0]
-                    pred_class = np.argmax(prediction)
-                    confidence = prediction[pred_class]
-                    
-                    # Track prediction if confident
-                    if confidence > PREDICTION_THRESHOLD:
-                        gesture = GESTURE_CLASSES[pred_class]
-                        current_gesture = gesture
-                        action_performed = perform_youtube_action(pred_class)
+                    try:
+                        # Prepare input based on model's requirements
+                        input_data = prepare_input_batch(frame_buffer, input_shape)
                         
-                        # Add to recent predictions
-                        recent_predictions.append((pred_class, confidence))
+                        # Run prediction
+                        prediction = model.predict(input_data, verbose=0)[0]
+                        pred_class = np.argmax(prediction)
+                        confidence = prediction[pred_class]
                         
-                        # Calculate accuracy
-                        if len(recent_predictions) >= 3:
-                            # How many predictions match the current one
-                            matching = sum(1 for p, _ in recent_predictions if p == pred_class)
-                            accuracy = (matching / len(recent_predictions)) * 100
-                            accuracy_history.append(accuracy)
+                        # Track prediction if confident
+                        if confidence > PREDICTION_THRESHOLD:
+                            gesture = GESTURE_CLASSES[pred_class]
+                            current_gesture = gesture
+                            action_performed = perform_youtube_action(pred_class)
+                            
+                            # Add to recent predictions
+                            recent_predictions.append((pred_class, confidence))
+                            
+                            # Calculate accuracy
+                            if len(recent_predictions) >= 3:
+                                # How many predictions match the current one
+                                matching = sum(1 for p, _ in recent_predictions if p == pred_class)
+                                accuracy = (matching / len(recent_predictions)) * 100
+                                accuracy_history.append(accuracy)
+                    except Exception as e:
+                        print(f"Prediction error: {e}")
+                        # If there's an input shape mismatch, print debug info
+                        print(f"Buffer shape: {np.array(frame_buffer).shape}")
+                        print(f"Expected input shape: {input_shape}")
             elif process_this_frame:
                 # Clear buffer when hand is lost
                 frame_buffer.clear()
                 current_gesture = None
             
             # Create information display
-            # Create a smaller, semi-transparent overlay instead of writing on the image
             info_overlay = np.zeros((150, 250, 3), dtype=np.uint8)
             
             # FPS
@@ -228,6 +279,10 @@ def capture_and_predict(model, camera_source=0):
                 cv2.putText(info_overlay, f"Accuracy: {avg_accuracy:.1f}%", (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 1)
             
+            # Display buffer status
+            cv2.putText(info_overlay, f"Frames: {len(frame_buffer)}/{NUM_FRAMES}", (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
             # Add overlay to main frame
             x_offset, y_offset = 10, 10
             overlay_h, overlay_w = info_overlay.shape[:2]
@@ -244,13 +299,8 @@ def capture_and_predict(model, camera_source=0):
                         0
                     )
             
-            # Resize for display if needed
-            if annotated.shape[0] > 600 or annotated.shape[1] > 800:
-                display_frame = cv2.resize(annotated, (800, 600))
-            else:
-                display_frame = annotated
-                
-            cv2.imshow("Gesture Control", display_frame)
+            # Display the frame
+            cv2.imshow("Gesture Control", annotated)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -265,22 +315,32 @@ def main():
         return
 
     try:
-        # Attempt to configure TensorFlow to use less memory
+        # First, inspect the model to understand its requirements
+        print("Inspecting model...")
+        model = load_model(model_path)
+        
+        # Update global parameters based on model inspection
+        global NUM_FRAMES, IMG_SIZE
+        input_shape = model.input_shape
+        
+        # If input shape is a 5D tensor (batch, frames, height, width, channels)
+        if len(input_shape) == 5:
+            NUM_FRAMES = input_shape[1]
+            IMG_SIZE = input_shape[2]  # Assuming height = width
+        
+        print(f"Using NUM_FRAMES={NUM_FRAMES}, IMG_SIZE={IMG_SIZE}")
+        
+        # Configure GPU memory growth
         gpus = tf.config.experimental.list_physical_devices('GPU')
         if gpus:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
             print("GPU memory growth enabled")
-                
-        # Load model
-        print("Loading model...")
-        model = load_model(model_path)
-        print("Model loaded successfully.")
         
-        # Run
+        # Start capturing and predicting
         capture_and_predict(model)
     except Exception as e:
-        print("Error:", e)
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
