@@ -19,6 +19,12 @@ physical_devices = tf.config.list_physical_devices('GPU')
 if len(physical_devices) > 0:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
+# Set MediaPipe logging level to ERROR to reduce verbose output
+os.environ['MEDIAPIPE_LOG_LEVEL'] = '2'  # 2 = ERROR level
+
+# Set TensorFlow logging level to ERROR
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 2 = ERROR level
+
 # Configuration parameters
 IMG_SIZE = 100  # Size to resize frames to (height and width)
 NUM_FRAMES = 18  # Number of frames to use from each video
@@ -40,11 +46,64 @@ GESTURE_CLASSES = {
 
 # Initialize MediaPipe - only initialize once to save memory
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,  # Set to False for better performance with sequential frames
-    max_num_hands=1,
-    min_detection_confidence=0.5
-)
+
+# Add a function to initialize and cleanup MediaPipe
+def initialize_mediapipe():
+    """Initialize MediaPipe hands detector with proper settings and reduced logging"""
+    return mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+        options=mp_hands.HandsOptions(
+            model_complexity=1,
+            enable_segmentation=False,
+            enable_world_landmarks=False
+        )
+    )
+
+def cleanup_mediapipe(hands_detector):
+    """Clean up MediaPipe resources"""
+    if hands_detector:
+        hands_detector.close()
+
+def extract_hand_landmarks(image, hands_detector=None):
+    """Extract hand landmarks from an image using MediaPipe with proper error handling"""
+    if hands_detector is None:
+        hands_detector = initialize_mediapipe()
+        cleanup_needed = True
+    else:
+        cleanup_needed = False
+
+    try:
+        # Convert to RGB for MediaPipe if needed
+        if image.shape[2] == 3 and image.dtype == np.uint8:
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image_rgb = image  # Avoid unnecessary conversions
+        
+        # Process the image
+        results = hands_detector.process(image_rgb)
+        
+        # Initialize landmarks array with zeros
+        landmarks = np.zeros((NUM_LANDMARKS, 3))  # x, y, z for each landmark
+        
+        # If hand is detected, extract landmarks
+        if results.multi_hand_landmarks:
+            hand_landmarks = results.multi_hand_landmarks[0]
+            for idx, landmark in enumerate(hand_landmarks.landmark):
+                landmarks[idx] = [landmark.x, landmark.y, landmark.z]
+        
+        if cleanup_needed:
+            cleanup_mediapipe(hands_detector)
+        
+        return landmarks, results.multi_hand_landmarks is not None
+        
+    except Exception as e:
+        print(f"Error in hand landmark extraction: {e}")
+        if cleanup_needed:
+            cleanup_mediapipe(hands_detector)
+        return np.zeros((NUM_LANDMARKS, 3)), False
 
 def load_csv_data(csv_path, base_folder=None):
     """Load and parse a CSV file with video folder names and class labels."""
@@ -82,32 +141,6 @@ def load_csv_data(csv_path, base_folder=None):
         print(f"Error loading CSV data: {e}")
     
     return data
-
-def extract_hand_landmarks(image):
-    """Extract hand landmarks from an image using MediaPipe"""
-    # Convert to RGB for MediaPipe if needed
-    if image.shape[2] == 3 and image.dtype == np.uint8:
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    else:
-        image_rgb = image  # Avoid unnecessary conversions
-    
-    # Process the image
-    results = hands.process(image_rgb)
-    
-    # Initialize landmarks array with zeros
-    landmarks = np.zeros((NUM_LANDMARKS, 3))  # x, y, z for each landmark
-    
-    # If hand landmarks detected, extract coordinates
-    if results.multi_hand_landmarks:
-        # Use only the first hand
-        hand_landmarks = results.multi_hand_landmarks[0]
-        
-        # Extract landmark coordinates (x, y, z)
-        for i, landmark in enumerate(hand_landmarks.landmark):
-            if i < NUM_LANDMARKS:
-                landmarks[i] = [landmark.x, landmark.y, landmark.z]
-    
-    return landmarks, results.multi_hand_landmarks is not None
 
 def get_hand_bounding_box(landmarks, image_shape, padding=20):
     """Get hand bounding box from landmarks with safety checks"""
@@ -180,7 +213,7 @@ def normalize_landmarks(landmarks):
     # Already normalized by MediaPipe, just flatten
     return landmarks.flatten()
 
-def load_video_sequence(base_path, folder_name, max_frames=NUM_FRAMES, save_landmarks=True):
+def load_video_sequence(base_path, folder_name, max_frames=NUM_FRAMES, save_landmarks=True, hands_detector=None):
     """Load a sequence of frames from a video folder and extract hand landmarks with error handling"""
     folder_path = os.path.join(base_path, folder_name)
     
@@ -217,13 +250,12 @@ def load_video_sequence(base_path, folder_name, max_frames=NUM_FRAMES, save_land
             
             if img is None:
                 print(f"Failed to load image: {img_path}")
-                # Add blank frame and landmarks
                 frames.append(np.zeros((IMG_SIZE, IMG_SIZE, NUM_CHANNELS), dtype=np.float32))
                 landmarks_sequence.append(np.zeros((NUM_LANDMARKS, 3), dtype=np.float32))
                 continue
             
             # Extract hand landmarks
-            landmarks, hand_detected = extract_hand_landmarks(img)
+            landmarks, hand_detected = extract_hand_landmarks(img, hands_detector)
             
             # If hand detected, crop image to hand area
             if hand_detected:
@@ -246,7 +278,6 @@ def load_video_sequence(base_path, folder_name, max_frames=NUM_FRAMES, save_land
             
         except Exception as e:
             print(f"Error processing image {img_file}: {e}")
-            # Add blank frame and landmarks
             frames.append(np.zeros((IMG_SIZE, IMG_SIZE, NUM_CHANNELS), dtype=np.float32))
             landmarks_sequence.append(np.zeros((NUM_LANDMARKS, 3), dtype=np.float32))
     
@@ -280,17 +311,21 @@ def data_generator(data_list, base_path, batch_size=BATCH_SIZE, use_landmarks=Tr
     """Generator to yield batches of video sequences with landmarks and memory management"""
     num_samples = len(data_list)
     
+    # Initialize MediaPipe hands detector for the generator
+    hands_detector = initialize_mediapipe()
+    
     while True:
+        # Clear some memory between batches
+        gc.collect()
+        
         # Shuffle the data
         indices = np.random.permutation(num_samples)
         
         for start_idx in range(0, num_samples, batch_size):
-            # Clear some memory between batches
-            gc.collect()
-            
             batch_indices = indices[start_idx:min(start_idx + batch_size, num_samples)]
             batch_size_actual = len(batch_indices)
             
+            # Initialize arrays with zeros
             batch_x = np.zeros((batch_size_actual, NUM_FRAMES, IMG_SIZE, IMG_SIZE, NUM_CHANNELS))
             batch_landmarks = np.zeros((batch_size_actual, NUM_FRAMES, NUM_LANDMARKS * 3))
             batch_y = np.zeros(batch_size_actual, dtype=np.int32)
@@ -300,7 +335,11 @@ def data_generator(data_list, base_path, batch_size=BATCH_SIZE, use_landmarks=Tr
                     folder_name, class_idx = data_list[idx]
                     
                     # Load video frames and landmarks
-                    frames, landmarks_seq = load_video_sequence(base_path, folder_name)
+                    frames, landmarks_seq = load_video_sequence(
+                        base_path, folder_name, 
+                        save_landmarks=False,
+                        hands_detector=hands_detector  # Pass the shared detector
+                    )
                     
                     # Normalize frames
                     normalized_frames = normalize_frames(frames)
@@ -321,6 +360,13 @@ def data_generator(data_list, base_path, batch_size=BATCH_SIZE, use_landmarks=Tr
                 yield (batch_x, batch_landmarks), batch_y
             else:
                 yield batch_x, batch_y
+            
+            # Clear memory after each batch
+            tf.keras.backend.clear_session()
+            gc.collect()
+    
+    # Clean up MediaPipe when generator is done
+    cleanup_mediapipe(hands_detector)
 
 def build_hybrid_model(reduced_complexity=True):
     """
@@ -545,6 +591,9 @@ def main():
     print("Hand Gesture Recognition - Model Training with Hand Landmarks")
     print("----------------------------------------------------------")
     
+    # Set TensorFlow logging level to ERROR
+    tf.get_logger().setLevel('ERROR')
+    
     # Define paths
     dataset_path = "/home/jinwoo/Desktop/hand-guesture-datascience/"
     train_csv = "/home/jinwoo/Desktop/hand-guesture-datascience/train.csv"
@@ -553,14 +602,13 @@ def main():
     
     # Configuration options
     use_landmarks = True
-    reduced_complexity = True  # Set to True to use simpler model architecture
-    incremental_training = True  # Set to True to train in smaller chunks
+    reduced_complexity = True
+    incremental_training = True
     
     # Create output directory if not exists
     os.makedirs(model_output_path, exist_ok=True)
     
     # Load training and validation data
-    print("\nLoading dataset information...")
     train_base_path = os.path.join(dataset_path, "train")
     val_base_path = os.path.join(dataset_path, "val")
     
@@ -571,23 +619,14 @@ def main():
     print(f"Found {len(val_data)} validation samples")
     
     # Create data generators
-    print("\nPreparing data generators...")
-    
-    # Choose appropriate batch size based on available memory
     batch_size = BATCH_SIZE
-    print(f"Using batch size: {batch_size}")
     
     # Build model based on user choice
-    print("\nBuilding model...")
     if use_landmarks:
-        print("Using hybrid model with both image data and hand landmarks")
-        print(f"Model complexity: {'Reduced' if reduced_complexity else 'Full'}")
         model = build_hybrid_model(reduced_complexity=reduced_complexity)
         train_gen = data_generator(train_data, train_base_path, batch_size, use_landmarks=True)
         val_gen = data_generator(val_data, val_base_path, batch_size, use_landmarks=True)
     else:
-        print("Using image-only model")
-        print(f"Model complexity: {'Reduced' if reduced_complexity else 'Full'}")
         model = build_image_only_model(reduced_complexity=reduced_complexity)
         train_gen = data_generator(train_data, train_base_path, batch_size, use_landmarks=False)
         val_gen = data_generator(val_data, val_base_path, batch_size, use_landmarks=False)
@@ -595,46 +634,40 @@ def main():
     # Define model summary
     model.summary()
     
-    # Define callbacks
+    # Define callbacks with reduced verbosity
     checkpoint = ModelCheckpoint(
         os.path.join(model_output_path, 'best_model.h5'),
         monitor='val_accuracy',
         save_best_only=True,
-        mode='max'
+        mode='max',
+        verbose=0
     )
     
     early_stopping = EarlyStopping(
         monitor='val_accuracy',
         patience=10,
-        mode='max'
+        mode='max',
+        verbose=0
     )
     
     reduce_lr = ReduceLROnPlateau(
         monitor='val_accuracy',
         factor=0.5,
         patience=5,
-        min_lr=1e-6
+        min_lr=1e-6,
+        verbose=0
     )
     
-    # Train the model
-    print("\nTraining model...")
-    
-    # Calculate steps
+    # Train the model with reduced verbosity
     steps_per_epoch = max(1, len(train_data) // batch_size)
     validation_steps = max(1, len(val_data) // batch_size)
     
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Validation steps: {validation_steps}")
-    
     if incremental_training:
-        # Train in smaller chunks to avoid memory issues
         epochs_per_increment = 2
         total_epochs = 10
         complete_history = {'accuracy': [], 'val_accuracy': [], 'loss': [], 'val_loss': []}
         
         for i in range(0, total_epochs, epochs_per_increment):
-            print(f"\nTraining increment {i//epochs_per_increment + 1}/{total_epochs//epochs_per_increment}")
-            
             history = model.fit(
                 train_gen,
                 steps_per_epoch=steps_per_epoch,
@@ -642,29 +675,20 @@ def main():
                 validation_steps=validation_steps,
                 epochs=epochs_per_increment,
                 callbacks=[checkpoint, early_stopping, reduce_lr],
-                verbose=1
+                verbose=1  # Show progress bar only
             )
             
-            # Accumulate history
             for key in complete_history:
                 if key in history.history:
                     complete_history[key].extend(history.history[key])
             
-            # Save checkpoint after each increment
             model.save(os.path.join(model_output_path, f'model_checkpoint_{i+epochs_per_increment}.h5'))
             
-            # Clear memory
             tf.keras.backend.clear_session()
             gc.collect()
             
-        # Convert complete history to History object
-        class HistoryWrapper:
-            def __init__(self, history_dict):
-                self.history = history_dict
-                
         history = HistoryWrapper(complete_history)
     else:
-        # Standard training
         history = model.fit(
             train_gen,
             steps_per_epoch=steps_per_epoch,
@@ -672,7 +696,7 @@ def main():
             validation_steps=validation_steps,
             epochs=10,
             callbacks=[checkpoint, early_stopping, reduce_lr],
-            verbose=1
+            verbose=1  # Show progress bar only
         )
     
     # Save model configuration
@@ -682,10 +706,11 @@ def main():
     plot_training_history(history)
     
     # Evaluate the model
-    print("\nEvaluating model...")
     evaluate_hybrid_model(model, val_data, val_base_path)
-    
-    print("\nTraining and evaluation complete!")
+
+class HistoryWrapper:
+    def __init__(self, history_dict):
+        self.history = history_dict
 
 if __name__ == "__main__":
     try:
