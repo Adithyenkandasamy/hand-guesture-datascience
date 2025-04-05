@@ -1,57 +1,130 @@
+import cv2
 import numpy as np
 import os
-import cv2
-import datetime
-from PIL import Image
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+from PIL import Image
+import tensorflow as tf
+import mediapipe as mp
+import json
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import TimeDistributed, Conv2D, MaxPooling2D, Dropout, Flatten, Dense, LSTM, Input, Concatenate
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import Dense, LSTM, Flatten, TimeDistributed, Conv2D, BatchNormalization
-from tensorflow.keras.layers import Activation, Dropout, MaxPooling2D, Conv3D, MaxPooling3D
-from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
-from tensorflow.keras import optimizers, regularizers
-
-# Set random seeds for reproducibility
-np.random.seed(30)
-import random as rn
-rn.seed(30)
-tf.random.set_seed(30)
+import pandas as pd
 
 # Configuration parameters
 IMG_SIZE = 100  # Size to resize frames to (height and width)
 NUM_FRAMES = 18  # Number of frames to use from each video
+NUM_CHANNELS = 3  # RGB channels
 NUM_CLASSES = 5  # Number of gesture classes
-BATCH_SIZE = 32  # Batch size for training
+NUM_LANDMARKS = 21  # Number of hand landmarks from MediaPipe
 
 # Gesture labels
 GESTURE_CLASSES = {
-    0: "Thumbs Up",    # Increase volume
-    1: "Thumbs Down",  # Decrease volume
-    2: "Left Swipe",   # Rewind 10 seconds
-    3: "Right Swipe",  # Forward 10 seconds
-    4: "Stop"          # Pause content
+    0: "Thumbs Up",
+    1: "Thumbs Down",
+    2: "Left Swipe",
+    3: "Right Swipe",
+    4: "Stop"
 }
 
-# Frame indices to use (choose specific frames from the 30-frame videos)
-FRAME_INDICES = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 27, 28, 29]
+# Initialize MediaPipe
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=True,
+    max_num_hands=1,
+    min_detection_confidence=0.5
+)
 
-# Helper functions
-def normalize_frames(frames):
-    """Normalize pixel values to range [0, 1]"""
-    return frames / 255.0
+def load_csv_data(csv_path):
+    """Load and parse a CSV file with video folder names and class labels."""
+    data = []
+    try:
+        with open(csv_path, "r") as f:
+            lines = f.readlines()
+            
+            # Skip header if present
+            if lines[0].lower().startswith('image') or lines[0].lower().startswith('imagename'):
+                lines = lines[1:]
+            
+            for line in lines:
+                line = line.strip()
+                parts = line.split(';')
+                if len(parts) >= 3:
+                    folder_name = parts[0]
+                    try:
+                        class_idx = int(parts[2])
+                        data.append((folder_name, class_idx))
+                    except ValueError:
+                        print(f"Invalid class index in line: {line}")
+    except Exception as e:
+        print(f"Error loading CSV data: {e}")
+    
+    return data
+
+def extract_hand_landmarks(image):
+    """Extract hand landmarks from an image using MediaPipe"""
+    # Convert to RGB for MediaPipe
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Get image dimensions
+    height, width = rgb_image.shape[:2]
+    
+    # Process the image with dimensions
+    results = hands.process(rgb_image)
+    
+    # Initialize landmarks array with zeros
+    landmarks = np.zeros((NUM_LANDMARKS, 3))  # x, y, z for each landmark
+    
+    # If hand landmarks detected, extract coordinates
+    if results.multi_hand_landmarks:
+        # Use only the first hand
+        hand_landmarks = results.multi_hand_landmarks[0]
+        
+        # Extract landmark coordinates (x, y, z)
+        for i, landmark in enumerate(hand_landmarks.landmark):
+            if i < NUM_LANDMARKS:
+                landmarks[i] = [landmark.x, landmark.y, landmark.z]
+    
+    return landmarks, results.multi_hand_landmarks is not None
+
+def get_hand_bounding_box(landmarks, image_shape):
+    """Get hand bounding box from landmarks"""
+    if np.all(landmarks == 0):
+        return None
+    
+    height, width = image_shape[:2]
+    
+    # Convert normalized coordinates to pixel values
+    x_coords = landmarks[:, 0] * width
+    y_coords = landmarks[:, 1] * height
+    
+    # Get non-zero coordinates
+    valid_x = x_coords[x_coords > 0]
+    valid_y = y_coords[y_coords > 0]
+    
+    if len(valid_x) == 0 or len(valid_y) == 0:
+        return None
+    
+    # Calculate bounding box
+    x_min, y_min = int(np.min(valid_x)), int(np.min(valid_y))
+    x_max, y_max = int(np.max(valid_x)), int(np.max(valid_y))
+    
+    # Add padding
+    padding = 20
+    x_min = max(0, x_min - padding)
+    y_min = max(0, y_min - padding)
+    x_max = min(width, x_max + padding)
+    y_max = min(height, y_max + padding)
+    
+    return (x_min, y_min, x_max, y_max)
 
 def preprocess_frame(frame, target_size=(IMG_SIZE, IMG_SIZE)):
     """Preprocess a single frame: crop if necessary and resize"""
     # Convert to PIL Image if not already
     if not isinstance(frame, Image.Image):
         frame = Image.fromarray(frame)
-
-    # Crop if the width is 160 (specific to your dataset)
-    if frame.size[0] == 160:
-        frame = frame.crop((20, 0, 140, 120))  # left=20, top=0, right=140, bottom=120
 
     # Resize to target size
     frame = frame.resize(target_size)
@@ -61,369 +134,380 @@ def preprocess_frame(frame, target_size=(IMG_SIZE, IMG_SIZE)):
 
     return frame
 
-def create_data_generator(source_path, file_list, batch_size, img_size, frame_indices, normalize_func):
-    """Generator function to create batches of data for training/validation"""
-    num_frames = len(frame_indices)
-    num_batches = int(np.ceil(len(file_list) / batch_size))
+def normalize_frames(frames):
+    """Normalize pixel values to range [0, 1]"""
+    return frames / 255.0
 
-    while True:
-        # Shuffle the file list
-        t = np.random.permutation(file_list)
+def normalize_landmarks(landmarks):
+    """Normalize landmark coordinates to range [0, 1]"""
+    # Already normalized by MediaPipe, just flatten
+    return landmarks.flatten()
+
+def load_video_sequence(base_path, folder_name, max_frames=NUM_FRAMES, save_landmarks=True):
+    """Load a sequence of frames from a video folder and extract hand landmarks"""
+    folder_path = os.path.join(base_path, folder_name)
+    
+    if not os.path.exists(folder_path):
+        print(f"Folder not found: {folder_path}")
+        return None, None
+    
+    # Get list of image files
+    img_files = sorted([f for f in os.listdir(folder_path) if f.endswith(('.jpg', '.jpeg', '.png'))])
+    
+    if len(img_files) == 0:
+        print(f"No image files found in {folder_path}")
+        return None, None
+    
+    # Load frames and extract landmarks
+    frames = []
+    landmarks_sequence = []
+    
+    for i, img_file in enumerate(img_files):
+        if i >= max_frames:
+            break
         
-        # Process each batch
-        for batch in range(num_batches):
-            # Calculate actual batch size for last batch
-            current_batch_size = min(batch_size, len(file_list) - batch * batch_size)
+        img_path = os.path.join(folder_path, img_file)
+        img = cv2.imread(img_path)
+        
+        if img is None:
+            print(f"Failed to load image: {img_path}")
+            continue
+        
+        # Extract hand landmarks
+        landmarks, hand_detected = extract_hand_landmarks(img)
+        
+        # If hand detected, crop image to hand area
+        if hand_detected:
+            bbox = get_hand_bounding_box(landmarks, img.shape)
+            if bbox is not None:
+                x_min, y_min, x_max, y_max = bbox
+                img = img[y_min:y_max, x_min:x_max]
+        
+        # Convert BGR to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Preprocess frame
+        processed_frame = preprocess_frame(img)
+        frames.append(processed_frame)
+        
+        # Add landmarks to sequence
+        landmarks_sequence.append(landmarks)
+    
+    # Pad with zeros if we don't have enough frames
+    while len(frames) < max_frames:
+        frames.append(np.zeros((IMG_SIZE, IMG_SIZE, NUM_CHANNELS), dtype=np.float32))
+        landmarks_sequence.append(np.zeros((NUM_LANDMARKS, 3), dtype=np.float32))
+    
+    # Save landmarks if requested
+    if save_landmarks:
+        landmarks_folder = os.path.join(os.path.dirname(base_path), "landmarks")
+        os.makedirs(landmarks_folder, exist_ok=True)
+        
+        landmarks_file = os.path.join(landmarks_folder, f"{folder_name}.npy")
+        np.save(landmarks_file, np.array(landmarks_sequence))
+    
+    return np.array(frames), np.array(landmarks_sequence)
+
+def data_generator(data_list, base_path, batch_size=16, use_landmarks=True):
+    """Generator to yield batches of video sequences with landmarks"""
+    num_samples = len(data_list)
+    
+    while True:
+        # Shuffle the data
+        indices = np.random.permutation(num_samples)
+        
+        for start_idx in range(0, num_samples, batch_size):
+            batch_indices = indices[start_idx:min(start_idx + batch_size, num_samples)]
+            batch_size_actual = len(batch_indices)
             
-            # Initialize arrays for batch data and labels
-            batch_data = np.zeros((current_batch_size, num_frames, img_size, img_size, 3))
-            batch_labels = np.zeros((current_batch_size, NUM_CLASSES))
+            batch_x = np.zeros((batch_size_actual, NUM_FRAMES, IMG_SIZE, IMG_SIZE, NUM_CHANNELS))
+            batch_landmarks = np.zeros((batch_size_actual, NUM_FRAMES, NUM_LANDMARKS * 3))
+            batch_y = np.zeros(batch_size_actual, dtype=np.int32)  # Changed to single dimension for class indices
             
-            # Process each video in the batch
-            for folder_idx in range(current_batch_size):
-                file_idx = batch * batch_size + folder_idx
-                line = t[file_idx].strip()
+            for i, idx in enumerate(batch_indices):
+                folder_name, class_idx = data_list[idx]
                 
-                # Skip header row if it exists
-                if line.lower().startswith('image') or line.lower().startswith('imagename'):
-                    continue
+                # Load video frames and landmarks
+                frames, landmarks_seq = load_video_sequence(base_path, folder_name)
                 
-                parts = line.split(';')
-                if len(parts) < 3:
-                    continue
-                
-                folder_name = parts[0]
-                
-                # Try to convert label to integer
-                try:
-                    class_idx = int(parts[2])
-                except ValueError:
-                    continue
+                if frames is not None:
+                    # Normalize frames
+                    normalized_frames = normalize_frames(frames)
+                    batch_x[i] = normalized_frames
+                    
+                    # Process landmarks
+                    for j, landmarks in enumerate(landmarks_seq):
+                        batch_landmarks[i, j] = normalize_landmarks(landmarks)
+                    
+                    # Store the class index directly
+                    batch_y[i] = class_idx
+            
+            if use_landmarks:
+                # Return as tuple instead of list
+                yield (batch_x, batch_landmarks), batch_y
+            else:
+                yield batch_x, batch_y
 
-                # List all frames in the folder
-                imgs = sorted(os.listdir(os.path.join(source_path, folder_name)))
-
-                # Process each selected frame
-                for i, frame_idx in enumerate(frame_indices):
-                    if frame_idx < len(imgs):
-                        # Load the frame
-                        img_path = os.path.join(source_path, folder_name, imgs[frame_idx])
-                        image = Image.open(img_path)
-
-                        # Preprocess the frame
-                        processed_frame = preprocess_frame(image, (img_size, img_size))
-
-                        # Normalize and store each channel
-                        for c in range(3):  # RGB channels
-                            batch_data[folder_idx, i, :, :, c] = normalize_func(processed_frame[:, :, c])
-
-                # One-hot encode the label
-                batch_labels[folder_idx, class_idx] = 1
-
-            yield batch_data, batch_labels
-
-def build_3d_cnn_model(input_shape, num_classes):
-    """Build and return a 3D CNN model for gesture recognition"""
-    model = Sequential()
-
-    # First 3D Convolutional Block
-    model.add(Conv3D(32, kernel_size=(3, 3, 3), input_shape=input_shape, padding='same'))
-    model.add(BatchNormalization())
-    model.add(Activation('relu'))
-    model.add(MaxPooling3D(pool_size=(1, 2, 2), strides=(1, 2, 2), padding='same'))
-
-    # Second 3D Convolutional Block
-    model.add(Conv3D(64, kernel_size=(3, 3, 3), padding='same'))
-    model.add(BatchNormalization())
-    model.add(Activation('relu'))
-    model.add(MaxPooling3D(pool_size=(1, 2, 2), strides=(1, 2, 2), padding='same'))
-
-    # Third 3D Convolutional Block
-    model.add(Conv3D(128, kernel_size=(3, 3, 3), padding='same'))
-    model.add(BatchNormalization())
-    model.add(Activation('relu'))
-    model.add(MaxPooling3D(pool_size=(2, 2, 2), strides=(2, 2, 2), padding='same'))
-
-    # Fourth 3D Convolutional Block
-    model.add(Conv3D(256, kernel_size=(3, 3, 3), padding='same'))
-    model.add(BatchNormalization())
-    model.add(Activation('relu'))
-    model.add(MaxPooling3D(pool_size=(2, 2, 2), strides=(2, 2, 2), padding='same'))
-
-    # Flatten the output
-    model.add(Flatten())
-
-    # Fully connected layers
-    model.add(Dense(256, activation='relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(128, activation='relu'))
-    model.add(Dropout(0.5))
-
+def build_hybrid_model():
+    """
+    Build a hybrid model that uses both image features and hand landmarks
+    """
+    # Image input branch
+    img_input = Input(shape=(NUM_FRAMES, IMG_SIZE, IMG_SIZE, NUM_CHANNELS))
+    
+    # CNN for image features
+    cnn = TimeDistributed(Conv2D(32, (3, 3), activation='relu', padding='same'))(img_input)
+    cnn = TimeDistributed(MaxPooling2D((2, 2)))(cnn)
+    cnn = TimeDistributed(Conv2D(64, (3, 3), activation='relu', padding='same'))(cnn)
+    cnn = TimeDistributed(MaxPooling2D((2, 2)))(cnn)
+    cnn = TimeDistributed(Conv2D(128, (3, 3), activation='relu', padding='same'))(cnn)
+    cnn = TimeDistributed(MaxPooling2D((2, 2)))(cnn)
+    cnn = TimeDistributed(Dropout(0.25))(cnn)
+    cnn = TimeDistributed(Flatten())(cnn)
+    
+    # Landmarks input branch
+    landmarks_input = Input(shape=(NUM_FRAMES, NUM_LANDMARKS * 3))
+    
+    # Dense layers for landmarks
+    landmarks_features = TimeDistributed(Dense(128, activation='relu'))(landmarks_input)
+    landmarks_features = TimeDistributed(Dense(256, activation='relu'))(landmarks_features)
+    landmarks_features = TimeDistributed(Dropout(0.25))(landmarks_features)
+    
+    # Merge two branches
+    merged = Concatenate()([cnn, landmarks_features])
+    
+    # LSTM layers for sequence learning
+    lstm = LSTM(256, return_sequences=True)(merged)
+    lstm = Dropout(0.3)(lstm)
+    lstm = LSTM(128)(lstm)
+    lstm = Dropout(0.3)(lstm)
+    
     # Output layer
-    model.add(Dense(num_classes, activation='softmax'))
-
+    output = Dense(NUM_CLASSES, activation='softmax')(lstm)
+    
+    # Create model
+    model = Model(inputs=[img_input, landmarks_input], outputs=output)
+    
+    # Compile model
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
     return model
 
-def setup_callbacks(model_dir):
-    """Set up callbacks for model training"""
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir)
-
-    # Model checkpoint to save the best model
-    filepath = os.path.join(model_dir, 'model-{epoch:02d}-{val_loss:.4f}-{val_categorical_accuracy:.4f}.h5')
-    checkpoint = ModelCheckpoint(
-        filepath=filepath,
-        monitor='val_categorical_accuracy',
-        save_best_only=True,
-        save_weights_only=False,
-        mode='max',
-        verbose=1
-    )
-
-    # Learning rate reduction on plateau
-    reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-        verbose=1
-    )
-
-    # Early stopping
-    early_stop = EarlyStopping(
-        monitor='val_loss',
-        patience=8,
-        restore_best_weights=True,
-        verbose=1
-    )
-
-    return [checkpoint, reduce_lr, early_stop]
-
-def plot_training_history(history, save_path=None):
-    """Plot training and validation metrics"""
-    # Create a figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-
-    # Plot accuracy
-    ax1.plot(history.history['categorical_accuracy'], label='Training Accuracy')
-    ax1.plot(history.history['val_categorical_accuracy'], label='Validation Accuracy')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Accuracy')
-    ax1.set_title('Model Accuracy')
-    ax1.legend(loc='lower right')
-
-    # Plot loss
-    ax2.plot(history.history['loss'], label='Training Loss')
-    ax2.plot(history.history['val_loss'], label='Validation Loss')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Loss')
-    ax2.set_title('Model Loss')
-    ax2.legend(loc='upper right')
-
-    # Adjust layout and display
-    plt.tight_layout()
-
-    # Save if a path is provided
-    if save_path:
-        plt.savefig(save_path)
-
-    plt.show()
-
-def plot_confusion_matrix(y_true, y_pred, class_names, save_path=None):
-    """Plot confusion matrix from model predictions"""
-    # Calculate confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-
-    # Normalize the confusion matrix
-    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-
-    # Create a figure
-    plt.figure(figsize=(10, 8))
-
-    # Plot the confusion matrix
-    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues',
-                xticklabels=class_names, yticklabels=class_names)
-
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Normalized Confusion Matrix')
-
-    # Save if a path is provided
-    if save_path:
-        plt.savefig(save_path)
-
-    plt.show()
-
-# Camera capture and real-time prediction
-def capture_and_predict(model, camera_source=0, prediction_threshold=0.7):
-    """Capture video from webcam and make real-time predictions"""
-    cap = cv2.VideoCapture(camera_source)
-
-    # Check if camera opened successfully
-    if not cap.isOpened():
-        print("Error: Could not open camera.")
-        return
-
-    # Buffer to store frames
-    frame_buffer = []
-
-    print("Starting real-time gesture recognition. Press 'q' to quit.")
-
-    while True:
-        # Capture frame-by-frame
-        ret, frame = cap.read()
-
-        if not ret:
-            print("Error: Failed to capture frame.")
-            break
-
-        # Preprocess the frame
-        processed_frame = preprocess_frame(frame, (IMG_SIZE, IMG_SIZE))
-
-        # Add to buffer and keep only the required number of frames
-        frame_buffer.append(processed_frame)
-        if len(frame_buffer) > NUM_FRAMES:
-            frame_buffer.pop(0)
-
-        # Make prediction when buffer is full
-        if len(frame_buffer) == NUM_FRAMES:
-            # Prepare input for model
-            input_data = np.array([normalize_frames(np.array(frame_buffer))])
-
-            # Make prediction
-            prediction = model.predict(input_data, verbose=0)[0]
-            predicted_class = np.argmax(prediction)
-            confidence = prediction[predicted_class]
-
-            # Display prediction if confidence is above threshold
-            if confidence > prediction_threshold:
-                gesture = GESTURE_CLASSES[predicted_class]
-                cv2.putText(frame, f"{gesture} ({confidence:.2f})", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-                # Display action associated with gesture (still keeping this for webcam demo)
-                action_map = {
-                    0: "Action: Volume UP",
-                    1: "Action: Volume DOWN",
-                    2: "Action: Rewind 10s",
-                    3: "Action: Forward 10s",
-                    4: "Action: Pause"
-                }
-                cv2.putText(frame, action_map[predicted_class], (10, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-
-        # Display the frame
-        cv2.imshow('Gesture Recognition', frame)
-
-        # Break the loop if 'q' is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    # Release the capture and close windows
-    cap.release()
-    cv2.destroyAllWindows()
-
-# Main execution function
-def main():
-    # Define paths
-    dataset_path = '/home/jinwoo/Desktop/hand-guesture-datascience/'
-    train_path = os.path.join(dataset_path, 'train')
-    val_path = os.path.join(dataset_path, 'val')
-
-    # Load and shuffle the train and validation files
-    train_files = np.random.permutation(open(os.path.join(dataset_path, 'train.csv')).readlines())
-    val_files = np.random.permutation(open(os.path.join(dataset_path, 'val.csv')).readlines())
-
-    # Create model directory with timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    model_dir = f"gesture_model_{timestamp}"
-
-    # Print dataset information
-    print(f"Total training samples: {len(train_files)}")
-    print(f"Total validation samples: {len(val_files)}")
-
-    # Check class distribution
-    train_labels = []
-    for file in train_files:
-        try:
-            label = int(file.strip().split(';')[2])
-            train_labels.append(label)
-        except ValueError:
-            continue  # Skip non-numeric labels
-
-    val_labels = []
-    for file in val_files:
-        try:
-            label = int(file.strip().split(';')[2])
-            val_labels.append(label)
-        except ValueError:
-            continue  # Skip non-numeric labels
-
-    print("\nTraining set class distribution:")
-    for i in range(NUM_CLASSES):
-        count = train_labels.count(i)
-        print(f"  Class {i} ({GESTURE_CLASSES[i]}): {count} samples ({count/len(train_labels)*100:.1f}%)")
-
-    print("\nValidation set class distribution:")
-    for i in range(NUM_CLASSES):
-        count = val_labels.count(i)
-        print(f"  Class {i} ({GESTURE_CLASSES[i]}): {count} samples ({count/len(val_labels)*100:.1f}%)")
-
-    # Create data generators
-    train_generator = create_data_generator(
-        train_path, train_files, BATCH_SIZE, IMG_SIZE, FRAME_INDICES, normalize_frames
-    )
-
-    val_generator = create_data_generator(
-        val_path, val_files, BATCH_SIZE, IMG_SIZE, FRAME_INDICES, normalize_frames
-    )
-
-    # Calculate steps per epoch
-    steps_per_epoch = int(np.ceil(len(train_files) / BATCH_SIZE))
-    validation_steps = int(np.ceil(len(val_files) / BATCH_SIZE))
-
-    # Build model
-    input_shape = (NUM_FRAMES, IMG_SIZE, IMG_SIZE, 3)
-    model = build_3d_cnn_model(input_shape, NUM_CLASSES)
+def build_image_only_model():
+    """
+    Build a ConvLSTM model using only image data (no landmarks)
+    """
+    model = Sequential([
+        TimeDistributed(Conv2D(32, (3, 3), activation='relu', padding='same'), input_shape=(NUM_FRAMES, IMG_SIZE, IMG_SIZE, NUM_CHANNELS)),
+        TimeDistributed(MaxPooling2D((2, 2))),
+        TimeDistributed(Conv2D(64, (3, 3), activation='relu', padding='same')),
+        TimeDistributed(MaxPooling2D((2, 2))),
+        TimeDistributed(Conv2D(128, (3, 3), activation='relu', padding='same')),
+        TimeDistributed(MaxPooling2D((2, 2))),
+        TimeDistributed(Dropout(0.25)),
+        TimeDistributed(Flatten()),
+        LSTM(256, return_sequences=True),
+        Dropout(0.3),
+        LSTM(128),
+        Dropout(0.3),
+        Dense(NUM_CLASSES, activation='softmax')
+    ])
 
     # Compile model
     model.compile(
-        optimizer=optimizers.Adam(learning_rate=0.001),
-        loss='categorical_crossentropy',
-        metrics=['categorical_accuracy']
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
     )
 
-    # Print model summary
-    model.summary()
+    return model
 
-    # Set up callbacks
-    callbacks = setup_callbacks(model_dir)
+def plot_training_history(history):
+    """Plot training and validation accuracy/loss"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Plot accuracy
+    ax1.plot(history.history['accuracy'])
+    ax1.plot(history.history['val_accuracy'])
+    ax1.set_title('Model Accuracy')
+    ax1.set_ylabel('Accuracy')
+    ax1.set_xlabel('Epoch')
+    ax1.legend(['Train', 'Validation'], loc='lower right')
+    
+    # Plot loss
+    ax2.plot(history.history['loss'])
+    ax2.plot(history.history['val_loss'])
+    ax2.set_title('Model Loss')
+    ax2.set_ylabel('Loss')
+    ax2.set_xlabel('Epoch')
+    ax2.legend(['Train', 'Validation'], loc='upper right')
+    
+    plt.tight_layout()
+    return fig
 
-    # Train model
+def evaluate_hybrid_model(model, eval_data, base_path):
+    """Evaluate the hybrid model performance on validation data"""
+    # Predictions for all validation samples
+    true_classes = []
+    pred_classes = []
+    
+    for folder_name, class_idx in eval_data:
+        # Load video sequence
+        frames, landmarks_seq = load_video_sequence(base_path, folder_name, save_landmarks=False)
+        
+        if frames is not None:
+            # Prepare input
+            img_input = np.zeros((1, NUM_FRAMES, IMG_SIZE, IMG_SIZE, NUM_CHANNELS))
+            landmarks_input = np.zeros((1, NUM_FRAMES, NUM_LANDMARKS * 3))
+            
+            normalized_frames = normalize_frames(frames)
+            img_input[0] = normalized_frames
+            
+            for j, landmarks in enumerate(landmarks_seq):
+                landmarks_input[0, j] = normalize_landmarks(landmarks)
+            
+            # Make prediction
+            prediction = model.predict([img_input, landmarks_input], verbose=0)[0]
+            predicted_class = np.argmax(prediction)
+            
+            # Store true and predicted classes
+            true_classes.append(class_idx)
+            pred_classes.append(predicted_class)
+    
+    # Calculate confusion matrix
+    cm = confusion_matrix(true_classes, pred_classes)
+    
+    # Plot confusion matrix
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=list(GESTURE_CLASSES.values()),
+               yticklabels=list(GESTURE_CLASSES.values()))
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    
+    # Print classification report
+    print("\nClassification Report:")
+    print(classification_report(true_classes, pred_classes, 
+                              target_names=list(GESTURE_CLASSES.values())))
+    
+    return cm
+
+def save_model_metadata(model_path, use_landmarks=True):
+    """Save model configuration parameters for use during inference"""
+    metadata = {
+        "img_size": IMG_SIZE,
+        "num_frames": NUM_FRAMES,
+        "num_channels": NUM_CHANNELS,
+        "num_classes": NUM_CLASSES,
+        "gesture_classes": GESTURE_CLASSES,
+        "use_landmarks": use_landmarks,
+        "num_landmarks": NUM_LANDMARKS
+    }
+    
+    # Save as JSON file
+    metadata_path = os.path.join(model_path, "model_metadata.json")
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=4)
+    
+    print(f"Model metadata saved to {metadata_path}")
+
+def main():
+    print("Hand Gesture Recognition - Model Training with Hand Landmarks")
+    print("----------------------------------------------------------")
+    
+    # Define paths - these were missing proper assignment
+    dataset_path = "/home/jinwoo/Desktop/hand-guesture-datascience/"
+    train_csv = "/home/jinwoo/Desktop/hand-guesture-datascience/train.csv"
+    val_csv = "/home/jinwoo/Desktop/hand-guesture-datascience/val.csv"
+    model_output_path = "/home/jinwoo/Desktop/hand-guesture-datascience/models"
+    
+    use_landmarks = True
+    
+    # Create output directory if not exists
+    if not os.path.exists(model_output_path):
+        os.makedirs(model_output_path)
+    
+    # Load training and validation data
+    print("\nLoading dataset information...")
+    train_data = load_csv_data(train_csv)
+    val_data = load_csv_data(val_csv)
+    
+    print(f"Found {len(train_data)} training samples")
+    print(f"Found {len(val_data)} validation samples")
+    
+    # Create data generators
+    train_base_path = os.path.join(dataset_path, "train")
+    val_base_path = os.path.join(dataset_path, "val")
+    
+    batch_size = 16
+    
+    # Build model based on user choice
+    print("\nBuilding model...")
+    if use_landmarks:
+        print("Using hybrid model with both image data and hand landmarks")
+        model = build_hybrid_model()
+        train_gen = data_generator(train_data, train_base_path, batch_size, use_landmarks=True)
+        val_gen = data_generator(val_data, val_base_path, batch_size, use_landmarks=True)
+    else:
+        print("Using image-only model")
+        model = build_image_only_model()
+        train_gen = data_generator(train_data, train_base_path, batch_size, use_landmarks=False)
+        val_gen = data_generator(val_data, val_base_path, batch_size, use_landmarks=False)
+    
+    # Compile the model
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    # Define callbacks
+    checkpoint = ModelCheckpoint(
+        os.path.join(model_output_path, 'best_model.h5'),
+        monitor='val_accuracy',
+        save_best_only=True,
+        mode='max'
+    )
+    
+    early_stopping = EarlyStopping(
+        monitor='val_accuracy',
+        patience=10,
+        mode='max'
+    )
+    
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_accuracy',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6
+    )
+    
+    # Train the model
     print("\nTraining model...")
     history = model.fit(
-        train_generator,
-        steps_per_epoch=steps_per_epoch,
-        epochs=10,  # You can adjust this
-        validation_data=val_generator,
-        validation_steps=validation_steps,
-        callbacks=callbacks,
+        train_gen,
+        steps_per_epoch=len(train_data) // batch_size,
+        validation_data=val_gen,
+        validation_steps=len(val_data) // batch_size,
+        epochs=10,
+        callbacks=[checkpoint, early_stopping, reduce_lr],
         verbose=1
     )
-
+    
+    # Save model configuration
+    save_model_metadata(os.path.join(model_output_path, 'model_metadata.json'), use_landmarks)
+    
     # Plot training history
-    plot_training_history(history, os.path.join(model_dir, 'training_history.png'))
-
-    # Save the final model
-    model.save(os.path.join(model_dir, 'final_gesture_model.h5'))
-
-    print(f"\nModel training complete. Model saved to {model_dir}/final_gesture_model.h5")
-
-    # Optional: Test with webcam
-    print("\nWould you like to test the model with your webcam? (y/n)")
-    response = input().lower()
-    if response == 'y':
-        capture_and_predict(model)
+    plot_training_history(history)
+    
+    # Evaluate the model
+    print("\nEvaluating model...")
+    evaluate_hybrid_model(model, val_data, val_base_path)
 
 if __name__ == "__main__":
     main()
