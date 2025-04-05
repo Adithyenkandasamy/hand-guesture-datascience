@@ -15,10 +15,10 @@ NUM_FRAMES = 18  # Default from training code
 NUM_LANDMARKS = 21  # Number of hand landmarks
 NUM_CHANNELS = 3
 NUM_CLASSES = 5
-PREDICTION_THRESHOLD = 0.65
-PREDICTION_INTERVAL = 0.2  # Time between predictions in seconds
-CONFIDENCE_HISTORY_SIZE = 5  # Number of predictions to track for confidence
-MIN_CONSISTENT_PREDICTIONS = 3  # Required consistent predictions to trigger action
+PREDICTION_THRESHOLD = 0.80  # Increased confidence threshold
+PREDICTION_INTERVAL = 0.5  # Increased time between predictions
+CONFIDENCE_HISTORY_SIZE = 10  # Increased history size for better averaging
+MIN_CONSISTENT_PREDICTIONS = 5  # Increased required consistent predictions
 
 # Gesture classes and corresponding actions
 GESTURE_CLASSES = {
@@ -35,7 +35,7 @@ mp_drawing = mp.solutions.drawing_utils
 
 def load_model_metadata(model_folder):
     """Load model configuration parameters"""
-    metadata_path = os.path.join(model_folder, "model_metadata.json")
+    metadata_path = os.path.join(model_folder, "/home/jinwoo/Desktop/hand-guesture-datascience/models/model_metadata.json")
     if os.path.exists(metadata_path):
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
@@ -268,52 +268,57 @@ def run_gesture_recognition(model, use_landmarks=True, camera_id=0):
                             pred_class = np.argmax(prediction)
                             confidence = prediction[pred_class]
                             
-                            # Log prediction
-                            print(f"Prediction: {GESTURE_CLASSES.get(pred_class, 'Unknown')} ({confidence:.4f})")
+                            # Only log prediction if it meets the threshold
+                            if confidence >= PREDICTION_THRESHOLD:
+                                print(f"Prediction: {GESTURE_CLASSES.get(pred_class, 'Unknown')} ({confidence:.4f})")
                             
-                            # Add to prediction history
-                            prediction_history.append((pred_class, confidence))
+                            # Add to prediction history if it meets the threshold
+                            if confidence >= PREDICTION_THRESHOLD:
+                                prediction_history.append((pred_class, confidence))
                             
                             # Analyze prediction history
-                            class_counts = {}
-                            class_confidences = {}
-                            
-                            for cls, conf in prediction_history:
-                                if cls not in class_counts:
-                                    class_counts[cls] = 0
-                                    class_confidences[cls] = []
-                                class_counts[cls] += 1
-                                class_confidences[cls].append(conf)
-                            
-                            # Find highest confidence class
-                            highest_avg_confidence = 0
-                            best_class = None
-                            
-                            for cls, confs in class_confidences.items():
-                                avg_conf = sum(confs) / len(confs)
-                                if avg_conf > highest_avg_confidence:
-                                    highest_avg_confidence = avg_conf
-                                    best_class = cls
-                            
-                            # Check if prediction meets threshold
-                            if best_class is not None and highest_avg_confidence >= PREDICTION_THRESHOLD:
-                                # Check if same as previous prediction
-                                if best_class == last_prediction_class:
-                                    consistent_predictions += 1
-                                else:
-                                    consistent_predictions = 1
+                            if len(prediction_history) >= MIN_CONSISTENT_PREDICTIONS:
+                                class_counts = {}
+                                class_confidences = {}
                                 
-                                last_prediction_class = best_class
+                                for cls, conf in prediction_history:
+                                    if cls not in class_counts:
+                                        class_counts[cls] = 0
+                                        class_confidences[cls] = []
+                                    class_counts[cls] += 1
+                                    class_confidences[cls].append(conf)
                                 
-                                # Execute action if consistent predictions
-                                if consistent_predictions >= MIN_CONSISTENT_PREDICTIONS:
-                                    current_gesture = GESTURE_CLASSES.get(best_class, "Unknown")
-                                    current_confidence = highest_avg_confidence
-                                    action_performed = perform_action(best_class)
+                                # Find highest confidence class
+                                highest_avg_confidence = 0
+                                best_class = None
+                                
+                                for cls, confs in class_confidences.items():
+                                    avg_conf = sum(confs) / len(confs)
+                                    if avg_conf > highest_avg_confidence:
+                                        highest_avg_confidence = avg_conf
+                                        best_class = cls
+                                
+                                # Check if prediction meets threshold
+                                if best_class is not None and highest_avg_confidence >= PREDICTION_THRESHOLD:
+                                    # Check if same as previous prediction
+                                    if best_class == last_prediction_class:
+                                        consistent_predictions += 1
+                                    else:
+                                        consistent_predictions = 1
                                     
-                                    # Reset consistency counter after performing action
-                                    consistent_predictions = 0
-                        
+                                    last_prediction_class = best_class
+                                    
+                                    # Execute action if consistent predictions
+                                    if consistent_predictions >= MIN_CONSISTENT_PREDICTIONS:
+                                        current_gesture = GESTURE_CLASSES.get(best_class, "Unknown")
+                                        current_confidence = highest_avg_confidence
+                                        action_performed = perform_action(best_class)
+                                        
+                                        # Reset consistency counter after performing action
+                                        consistent_predictions = 0
+                                        
+                                        # Clear prediction history after successful action
+                                        prediction_history.clear()
                         except Exception as e:
                             print(f"Error during prediction: {e}")
                             import traceback
