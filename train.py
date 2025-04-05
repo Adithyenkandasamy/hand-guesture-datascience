@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import tensorflow as tf
 import mediapipe as mp
+import mediapipe.python.solutions.hands as mp_hands
 import json
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import TimeDistributed, Conv2D, MaxPooling2D, Dropout, Flatten, Dense, LSTM, Input, Concatenate
@@ -45,22 +46,19 @@ GESTURE_CLASSES = {
 }
 
 # Initialize MediaPipe - only initialize once to save memory
-mp_hands = mp.solutions.hands
+mp_hands = mp_hands
 
 # Add a function to initialize and cleanup MediaPipe
 def initialize_mediapipe():
     """Initialize MediaPipe hands detector with proper settings and reduced logging"""
-    return mp_hands.Hands(
+    hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
-        options=mp_hands.HandsOptions(
-            model_complexity=1,
-            enable_segmentation=False,
-            enable_world_landmarks=False
-        )
+        model_complexity=1
     )
+    return hands
 
 def cleanup_mediapipe(hands_detector):
     """Clean up MediaPipe resources"""
